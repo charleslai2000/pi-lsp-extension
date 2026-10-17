@@ -20,7 +20,7 @@ import {
 	runAnalyzersForFile,
 } from "../analyzer-core.js";
 import { FORMATTERS, getFormatterConfigsForFile } from "../formatter-core.js";
-import { LSPManager, LSP_SERVERS, LANGUAGE_IDS } from "../lsp-core.js";
+import { LSPManager, LSP_SERVERS, LANGUAGE_IDS, getServerConfigsForFile } from "../lsp-core.js";
 import { loadResolvedLspSettings } from "../lsp-settings.js";
 import { resolveLspUiState } from "../lsp.js";
 import {
@@ -172,6 +172,11 @@ test("LANGUAGE_IDS: Rust extension", async () => {
 	assertEquals(LANGUAGE_IDS[".rs"], "rust", ".rs should map to rust");
 });
 
+test("LANGUAGE_IDS: CUDA extensions", async () => {
+	assertEquals(LANGUAGE_IDS[".cu"], "cuda", ".cu should map to cuda");
+	assertEquals(LANGUAGE_IDS[".cuh"], "cuda", ".cuh should map to cuda");
+});
+
 test("LANGUAGE_IDS: Kotlin extensions", async () => {
 	assertEquals(LANGUAGE_IDS[".kt"], "kotlin", ".kt should map to kotlin");
 	assertEquals(LANGUAGE_IDS[".kts"], "kotlin", ".kts should map to kotlin");
@@ -291,6 +296,34 @@ test("LSP_SERVERS: has Ty server", async () => {
 	assert(server !== undefined, "Should have ty server");
 	assertIncludes(server!.extensions, ".py", "Should handle .py");
 	assertIncludes(server!.extensions, ".pyi", "Should handle .pyi");
+});
+
+test("LSP_SERVERS: clangd handles CUDA and existing C/C++ extensions", async () => {
+	const server = LSP_SERVERS.find((s) => s.id === "clangd");
+	assert(server !== undefined, "Should have clangd server");
+	for (const ext of [".cu", ".cuh", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"]) {
+		assertIncludes(server!.extensions, ext, `clangd should handle ${ext}`);
+	}
+});
+
+test("CUDA extensions route to the existing clangd server", async () => {
+	await withTempDir({ "compile_commands.json": "[]", "kernel.cu": "__global__ void kernel() {}", "kernel.cuh": "__device__ int helper() { return 1; }" }, async (dir) => {
+		const settings = { ...loadResolvedLspSettings(dir), servers: { clangd: { rootMarkers: ["compile_commands.json", "compile_flags.txt", "CMakeLists.txt", "Makefile"] } } };
+		for (const file of ["kernel.cu", "kernel.cuh"]) {
+			assertEquals(LANGUAGE_IDS["." + file.split(".").pop()], "cuda", `${file} should use CUDA language ID`);
+			const configs = getServerConfigsForFile(join(dir, file), dir, settings);
+			assertEquals(configs.length, 1, `${file} should select exactly one server`);
+			assertEquals(configs[0]!.id, "clangd", `${file} should reuse clangd`);
+		}
+	});
+});
+
+test("clangd: project root markers can be customized", async () => {
+	await withTempDir({ "sglang-project-root": "", "src/kernel.cu": "__global__ void kernel() {}" }, async (dir) => {
+		const server = LSP_SERVERS.find((s) => s.id === "clangd")!;
+		const root = server.findRoot(join(dir, "src/kernel.cu"), dir, { rootMarkers: ["sglang-project-root"] });
+		assertEquals(root, dir, "Custom clangd root marker should be honored");
+	});
 });
 
 test("LSP_SERVERS: includes opencode-style built-ins", async () => {
