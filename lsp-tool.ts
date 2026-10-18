@@ -1,7 +1,5 @@
 import { open } from "node:fs/promises";
 import * as path from "node:path";
-import { Type } from "@sinclair/typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import type {
@@ -43,9 +41,8 @@ import {
 	toLocation,
 } from "./lsp-tool-formatters.js";
 import {
-	OPERATIONS,
+	lspToolParameters,
 	parseLspToolInput,
-	SEVERITY_FILTERS,
 	type LspToolInput,
 	type Operation,
 } from "./lsp-tool-schemas.js";
@@ -56,36 +53,7 @@ const PREVIEW_LINES = 10;
 const MAX_LSP_FILE_SIZE_BYTES = 10_000_000;
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
 
-const LspParams = Type.Object({
-	operation: StringEnum(OPERATIONS),
-	filePath: Type.Optional(
-		Type.String({ description: "Absolute or relative path to the file." }),
-	),
-	filePaths: Type.Optional(
-		Type.Array(Type.String(), {
-			description: "File paths for workspaceDiagnostics.",
-		}),
-	),
-	line: Type.Optional(Type.Number({ description: "1-based line number." })),
-	character: Type.Optional(
-		Type.Number({ description: "1-based character offset." }),
-	),
-	endLine: Type.Optional(
-		Type.Number({ description: "1-based end line for range operations." }),
-	),
-	endCharacter: Type.Optional(
-		Type.Number({ description: "1-based end character for range operations." }),
-	),
-	newName: Type.Optional(
-		Type.String({ description: "New symbol name for rename." }),
-	),
-	severity: Type.Optional(
-		StringEnum(SEVERITY_FILTERS, {
-			description:
-				'Filter diagnostics: "all" | "error" | "warning" | "info" | "hint".',
-		}),
-	),
-});
+const LspParams = lspToolParameters;
 
 type LspParamsType = LspToolInput;
 

@@ -53,18 +53,19 @@
     ]
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.33",
     "@vscode/tree-sitter-wasm": "^0.3.1",
     "linguist-js": "^3.0.2",
     "vscode-languageserver-protocol": "~3.17.5",
     "zod": "^4.1.12"
   },
   "peerDependencies": {
+    "@sinclair/typebox": "*",
     "@mariozechner/pi-ai": "^0.66.0",
     "@mariozechner/pi-coding-agent": "^0.66.0",
     "@mariozechner/pi-tui": "^0.66.0"
   },
   "devDependencies": {
+    "@sinclair/typebox": "^0.34.33",
     "@mariozechner/pi-ai": "^0.66.0",
     "@mariozechner/pi-coding-agent": "^0.66.0",
     "@mariozechner/pi-tui": "^0.66.0",

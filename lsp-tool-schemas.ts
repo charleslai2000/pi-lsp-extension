@@ -1,3 +1,5 @@
+import { Type } from "@sinclair/typebox";
+import { StringEnum } from "@mariozechner/pi-ai";
 import { z } from "zod/v4";
 
 export const OPERATIONS = [
@@ -41,23 +43,20 @@ const positionSchema = {
   character: positiveInt("1-based character offset."),
 };
 
-const claudeCoreOperationSchema = z.strictObject({
-  operation: z.enum([
-    "goToDefinition",
-    "findReferences",
-    "hover",
-    "documentHighlight",
-    "documentSymbol",
-    "workspaceSymbol",
-    "goToImplementation",
-    "typeDefinition",
-    "prepareCallHierarchy",
-    "incomingCalls",
-    "outgoingCalls",
-    "setBreakpoint",
-  ]),
+const positionedFileOperation = <T extends Operation>(operation: T) => z.strictObject({
+  operation: z.literal(operation),
   filePath: filePathField,
   ...positionSchema,
+});
+
+const documentSymbolSchema = z.strictObject({
+  operation: z.literal("documentSymbol"),
+  filePath: filePathField,
+});
+
+const workspaceSymbolSchema = z.strictObject({
+  operation: z.literal("workspaceSymbol"),
+  filePath: filePathField,
 });
 
 const diagnosticsSchema = z.strictObject({
@@ -114,15 +113,49 @@ const codeActionSchema = z.strictObject({
   }
 });
 
-export const lspToolInputSchema = z.discriminatedUnion("operation", [
-  claudeCoreOperationSchema,
+const positionedOperations = [
+  "goToDefinition", "findReferences", "hover", "documentHighlight",
+  "goToImplementation", "typeDefinition", "prepareCallHierarchy", "incomingCalls",
+  "outgoingCalls", "signatureHelp", "prepareRename", "setBreakpoint",
+] as const;
+
+export const lspToolInputSchema = z.union([
+  ...positionedOperations.map((operation) => positionedFileOperation(operation)),
+  documentSymbolSchema,
+  workspaceSymbolSchema,
   diagnosticsSchema,
   workspaceDiagnosticsSchema,
-  signatureHelpSchema,
   renameSchema,
-  prepareRenameSchema,
   foldingRangeSchema,
   codeActionSchema,
+] as const);
+
+const toolFilePath = Type.String({ minLength: 1, description: "Absolute or relative path to the file." });
+const toolDiagnosticSeverity = Type.Union(
+  SEVERITY_FILTERS.map((severity) => Type.Literal(severity)),
+  { description: 'Filter diagnostics: "all" | "error" | "warning" | "info" | "hint".' },
+);
+const toolPosition = {
+  line: Type.Integer({ minimum: 1, description: "1-based line number." }),
+  character: Type.Integer({ minimum: 1, description: "1-based character offset." }),
+};
+const operationToolSchema = <T extends Operation>(operation: T, fields: Record<string, any>) =>
+  Type.Object({ operation: Type.Literal(operation), ...fields }, { additionalProperties: false });
+
+// Pi receives an operation-specific TypeBox `anyOf`, not a generic object of
+// optional fields. Each strict branch matches the corresponding Zod runtime contract;
+// Pi 0.86/0.87's TypeBox validator supports these schemas.
+export const lspToolParameters = Type.Union([
+  ...positionedOperations.map((operation) =>
+    operationToolSchema(operation, { filePath: toolFilePath, ...toolPosition })),
+  operationToolSchema("documentSymbol", { filePath: toolFilePath }),
+  operationToolSchema("workspaceSymbol", { filePath: toolFilePath }),
+  operationToolSchema("diagnostics", { filePath: toolFilePath, severity: Type.Optional(toolDiagnosticSeverity) }),
+  operationToolSchema("workspaceDiagnostics", { filePaths: Type.Array(toolFilePath, { minItems: 1 }), severity: Type.Optional(toolDiagnosticSeverity) }),
+  operationToolSchema("rename", { filePath: toolFilePath, ...toolPosition, newName: Type.String({ minLength: 1 }) }),
+  operationToolSchema("foldingRange", { filePath: toolFilePath }),
+  operationToolSchema("codeAction", { filePath: toolFilePath, ...toolPosition }),
+  operationToolSchema("codeAction", { filePath: toolFilePath, ...toolPosition, endLine: Type.Integer({ minimum: 1 }), endCharacter: Type.Integer({ minimum: 1 }) }),
 ]);
 
 export type LspToolInput = z.infer<typeof lspToolInputSchema>;

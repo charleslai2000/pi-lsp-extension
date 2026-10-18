@@ -35,7 +35,8 @@ import {
   formatWorkspaceSymbolResult,
 } from "../lsp-tool-formatters.js";
 import { buildOperationSummary, withBackendLabel } from "../lsp-tool.js";
-import { safeParseLspToolInput } from "../lsp-tool-schemas.js";
+import { lspToolParameters, safeParseLspToolInput } from "../lsp-tool-schemas.js";
+import { Value } from "@sinclair/typebox/value";
 import { extractApplyPatchPaths, extractBashRedirectionPaths, selectPendingDiagnosticsForConfig } from "../lsp.js";
 
 // ============================================================================
@@ -466,15 +467,46 @@ test("formatFoldingRangeResult: formats ranges", () => {
 // lsp-tool zod schema tests
 // ============================================================================
 
-test("safeParseLspToolInput: accepts Claude-style core operation", () => {
-  const result = safeParseLspToolInput({
-    operation: "goToDefinition",
+test("LSP tool schema accepts every operation's minimal valid arguments", () => {
+  const positioned = {
     filePath: "src/index.ts",
-    line: 12,
-    character: 7,
-  });
+    line: 1,
+    character: 1,
+  };
+  const cases = [
+    ...["goToDefinition", "findReferences", "hover", "documentHighlight", "goToImplementation", "typeDefinition", "prepareCallHierarchy", "incomingCalls", "outgoingCalls", "signatureHelp", "prepareRename", "setBreakpoint"]
+      .map((operation) => ({ operation, ...positioned })),
+    { operation: "documentSymbol", filePath: "README.md" },
+    { operation: "diagnostics", filePath: "README.md" },
+    { operation: "workspaceDiagnostics", filePaths: ["README.md"] },
+    { operation: "rename", ...positioned, newName: "renamed" },
+    { operation: "foldingRange", filePath: "README.md" },
+    { operation: "codeAction", ...positioned },
+  ];
+  for (const input of cases) {
+    assertEqual(Value.Check(lspToolParameters, input), true, `Tool schema rejected ${JSON.stringify(input)}`);
+    assertEqual(safeParseLspToolInput(input).success, true, `Runtime schema rejected ${JSON.stringify(input)}`);
+  }
+});
 
-  assertEqual(result.success, true);
+test("LSP schemas reject missing required fields and cross-operation pollution", () => {
+  const invalid = [
+    { operation: "documentSymbol", filePath: "README.md", line: 1, character: 1 },
+    { operation: "documentSymbol", filePath: "README.md", severity: "all" },
+    { operation: "diagnostics", filePath: "README.md", line: 1, character: 1 },
+    { operation: "diagnostics", filePath: "README.md", newName: "renamed" },
+    { operation: "diagnostics", filePath: "README.md", severity: "invalid" },
+    { operation: "goToDefinition", filePath: "src/index.ts", line: 1 },
+    { operation: "findReferences", filePath: "src/index.ts", character: 1 },
+    { operation: "workspaceDiagnostics", filePaths: [] },
+    { operation: "workspaceDiagnostics", filePaths: ["README.md"], line: 1, character: 1 },
+    { operation: "rename", filePath: "src/index.ts", line: 1, character: 1 },
+    { operation: "codeAction", ...{ filePath: "src/index.ts", line: 1, character: 1 }, endLine: 2 },
+  ];
+  for (const input of invalid) {
+    assertEqual(Value.Check(lspToolParameters, input), false, `Tool schema accepted ${JSON.stringify(input)}`);
+    assertEqual(safeParseLspToolInput(input).success, false, `Runtime schema accepted ${JSON.stringify(input)}`);
+  }
 });
 
 test("safeParseLspToolInput: accepts typeDefinition and prepareRename", () => {
