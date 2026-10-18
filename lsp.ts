@@ -159,6 +159,27 @@ const SERVER_STATUS_LABELS: Record<string, string> = {
 
 const DOCTOR_REPORT_RELATIVE_PATH = path.join(".pi", "lsp-doctor.md");
 const DOCTOR_MAX_FILES = 25;
+const DOCTOR_TOTAL_TIMEOUT_MS = 90_000;
+const DOCTOR_FILE_TIMEOUT_MS = 15_000;
+const DOCTOR_FILE_CONCURRENCY = 4;
+
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const runWorker = async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, runWorker));
+  return results;
+}
 
 function normalizeHookMode(value: unknown): HookMode | undefined {
   if (value === "edit_write" || value === "agent_end" || value === "disabled") return value;
@@ -760,6 +781,30 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function buildDoctorReport(ctx: ExtensionContext): Promise<string> {
+    const deadline = Date.now() + DOCTOR_TOTAL_TIMEOUT_MS;
+    const remaining = () => Math.max(0, deadline - Date.now());
+    const withDeadline = async <T>(
+      label: string,
+      operation: (signal: AbortSignal) => Promise<T>,
+      timeoutMs: number,
+    ): Promise<T> => {
+      const controller = new AbortController();
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          operation(controller.signal),
+          new Promise<T>((_resolve, reject) => {
+            timer = setTimeout(() => {
+              controller.abort();
+              reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        controller.abort();
+      }
+    };
     const settings = loadResolvedLspSettings(ctx.cwd);
     const manager = getOrCreateManager(ctx.cwd);
     const files = walkFiles(ctx.cwd, DOCTOR_MAX_FILES);
@@ -819,75 +864,115 @@ export default function (pi: ExtensionAPI) {
       return lines.join("\n");
     }
 
-    for (const filePath of supportedFiles) {
+    const fileReports = await mapWithConcurrency(supportedFiles, DOCTOR_FILE_CONCURRENCY, async (filePath, index) => {
+      const fileLines: string[] = [];
+      if (remaining() <= 0) {
+        fileLines.push(`- Doctor stopped: total time limit of ${DOCTOR_TOTAL_TIMEOUT_MS}ms reached.`);
+        return fileLines;
+      }
       const relativePath = path.relative(ctx.cwd, filePath);
       const serverConfigs = getServerConfigsForFile(filePath, ctx.cwd, settings);
       const serverIds = serverConfigs.map((config) => config.id);
       const formatterIds = getFormatterConfigsForFile(filePath, ctx.cwd).map((formatter) => formatter.id);
       const analyzerIds = getAnalyzerConfigsForFile(filePath, ctx.cwd).map((analyzer) => analyzer.id);
-      lines.push(`### ${relativePath}`);
-      lines.push("");
-      lines.push(`- Candidate servers: ${serverIds.join(", ") || "none"}`);
-      lines.push(`- Candidate formatters: ${formatterIds.join(", ") || "none"}`);
-      lines.push(`- Candidate analyzers: ${analyzerIds.join(", ") || "none"}`);
+      fileLines.push(`### ${relativePath}`);
+      fileLines.push("");
+      fileLines.push(`- Candidate servers: ${serverIds.join(", ") || "none"}`);
+      fileLines.push(`- Candidate formatters: ${formatterIds.join(", ") || "none"}`);
+      fileLines.push(`- Candidate analyzers: ${analyzerIds.join(", ") || "none"}`);
 
+      const fileDeadline = Date.now() + Math.min(remaining(), DOCTOR_FILE_TIMEOUT_MS);
+      const stageDeadline = () => Math.max(1, Math.min(fileDeadline - Date.now(), remaining()));
+      const elapsedFile = Date.now();
+      const progress = (stage: string) => {
+        const status = `LSP doctor: ${relativePath} — ${stage} (${Date.now() - elapsedFile}ms)`;
+        fileLines.push(`- Progress: ${stage} (${Date.now() - elapsedFile}ms elapsed)`);
+        if (ctx.hasUI) ctx.ui.notify(status, "info");
+        else console.error(status);
+      };
+      if (ctx.hasUI) ctx.ui.notify(`LSP doctor: checking ${relativePath} (${index + 1}/${supportedFiles.length})`, "info");
+      let fileTimedOut = false;
       try {
-        const clients = await manager.getClientsForFile(filePath);
-        lines.push(`- Active/initialized servers: ${clients.length > 0 ? clients.map((client: any) => client.root).join(", ") : "none"}`);
+        const clients = await withDeadline("LSP client initialization", () => manager.getClientsForFile(filePath), stageDeadline());
+        fileLines.push(`- Active/initialized servers: ${clients.length > 0 ? clients.map((client: any) => client.root).join(", ") : "none"}`);
+        progress("client initialization complete");
       } catch (error) {
-        lines.push(`- Client initialization error: ${error instanceof Error ? error.message : String(error)}`);
+        fileTimedOut = /timed out/i.test(error instanceof Error ? error.message : String(error));
+        fileLines.push(`- Client initialization error: ${error instanceof Error ? error.message : String(error)}`);
+        progress("client initialization failed/timed out");
+      }
+
+      if (fileTimedOut || remaining() <= 0) {
+        fileLines.push(fileTimedOut
+          ? "- Doctor stopped after the per-file deadline; remaining checks skipped."
+          : "- Remaining LSP and analyzer checks skipped after the total deadline.", "");
+        return fileLines;
       }
 
       try {
-        const result = await manager.touchFileAndWait(filePath, diagnosticsWaitMsForFile(filePath));
+        const result = await withDeadline("LSP diagnostics", (signal) => manager.touchFileAndWait(filePath, diagnosticsWaitMsForFile(filePath), signal), stageDeadline());
         if (result.unsupported) {
-          lines.push(`- LSP status: unsupported`);
-          if (result.error) lines.push(`- Reason: ${result.error}`);
+          fileLines.push(`- LSP status: unsupported`);
+          if (result.error) fileLines.push(`- Reason: ${result.error}`);
         } else if (!result.receivedResponse) {
-          lines.push(`- LSP status: no response`);
-          if (result.error) lines.push(`- Reason: ${result.error}`);
+          fileLines.push(`- LSP status: no response`);
+          if (result.error) fileLines.push(`- Reason: ${result.error}`);
         } else {
-          lines.push(`- LSP status: responded`);
-          lines.push(`- Diagnostics: ${result.diagnostics.length}`);
+          fileLines.push(`- LSP status: responded`);
+          fileLines.push(`- Diagnostics: ${result.diagnostics.length}`);
           const preview = result.diagnostics.slice(0, 5);
           if (preview.length === 0) {
-            lines.push("- Diagnostic preview: none");
+            fileLines.push("- Diagnostic preview: none");
           } else {
-            lines.push("- Diagnostic preview:");
+            fileLines.push("- Diagnostic preview:");
             for (const diagnostic of preview) {
-              lines.push(`  - ${formatDiagnostic(diagnostic)}`);
+              fileLines.push(`  - ${formatDiagnostic(diagnostic)}`);
             }
           }
         }
+        progress("diagnostics complete");
       } catch (error) {
-        lines.push(`- LSP check error: ${error instanceof Error ? error.message : String(error)}`);
+        fileTimedOut = /timed out/i.test(error instanceof Error ? error.message : String(error));
+        fileLines.push(`- LSP check error: ${error instanceof Error ? error.message : String(error)}`);
+        progress("diagnostics failed/timed out");
+      }
+
+      if (fileTimedOut || remaining() <= 0) {
+        fileLines.push(fileTimedOut ? "- Doctor stopped after the per-file deadline; remaining checks skipped." : "- Analyzer check skipped after the total deadline.", "");
+        return fileLines;
       }
 
       try {
-        const analysis = await runAnalyzersForFile(filePath, ctx.cwd);
+        const analysis = await withDeadline("Analyzer", (signal) => runAnalyzersForFile(filePath, ctx.cwd, signal), stageDeadline());
         if (analysis.skipped) {
-          lines.push(`- Analyzer status: ${analysis.skipped}`);
+          fileLines.push(`- Analyzer status: ${analysis.skipped}`);
         } else {
-          lines.push(`- Analyzer status: ran ${analysis.analyzerIds?.join(", ") ?? analysis.analyzerId ?? "unknown"}`);
-          lines.push(`- Analyzer findings: ${analysis.findings.length}`);
+          fileLines.push(`- Analyzer status: ran ${analysis.analyzerIds?.join(", ") ?? analysis.analyzerId ?? "unknown"}`);
+          fileLines.push(`- Analyzer findings: ${analysis.findings.length}`);
           if (analysis.notes && analysis.notes.length > 0) {
-            lines.push(`- Analyzer notes:`);
-            for (const note of analysis.notes) lines.push(`  - ${note.source}: ${note.message}`);
+            fileLines.push(`- Analyzer notes:`);
+            for (const note of analysis.notes) fileLines.push(`  - ${note.source}: ${note.message}`);
           }
           if (analysis.errors && analysis.errors.length > 0) {
-            lines.push(`- Analyzer errors:`);
-            for (const error of analysis.errors) lines.push(`  - ${error}`);
+            fileLines.push(`- Analyzer errors:`);
+            for (const error of analysis.errors) fileLines.push(`  - ${error}`);
           } else if (analysis.error) {
-            lines.push(`- Analyzer stderr: ${analysis.error}`);
+            fileLines.push(`- Analyzer stderr: ${analysis.error}`);
           }
         }
+        progress("analyzer complete");
       } catch (error) {
-        lines.push(`- Analyzer check error: ${error instanceof Error ? error.message : String(error)}`);
+        fileTimedOut = /timed out/i.test(error instanceof Error ? error.message : String(error));
+        fileLines.push(`- Analyzer check error: ${error instanceof Error ? error.message : String(error)}`);
+        progress("analyzer failed/timed out");
       }
 
-      lines.push("");
-    }
+      if (fileTimedOut) fileLines.push("- Remaining files skipped after per-file deadline.");
+      fileLines.push("");
+      return fileLines;
+    });
 
+    for (const fileLines of fileReports) lines.push(...fileLines);
     return lines.join("\n");
   }
 
@@ -950,11 +1035,22 @@ export default function (pi: ExtensionAPI) {
 
       const command = args.trim();
       if (command === "doctor") {
-        const content = await buildDoctorReport(ctx);
-        const reportPath = await writeDoctorReportFile(ctx.cwd, content);
-        const message = `LSP doctor report written to ${reportPath}`;
-        if (ctx.hasUI) ctx.ui.notify(message, "info");
-        else console.log(message);
+        const reportPath = path.join(ctx.cwd, DOCTOR_REPORT_RELATIVE_PATH);
+        try {
+          const content = await buildDoctorReport(ctx);
+          await writeDoctorReportFile(ctx.cwd, content);
+          const message = `LSP doctor report written to ${reportPath}`;
+          if (ctx.hasUI) ctx.ui.notify(message, "info");
+          else console.log(message);
+        } catch (error) {
+          const message = `LSP doctor failed: ${error instanceof Error ? error.message : String(error)}`;
+          if (ctx.hasUI) ctx.ui.notify(message, "error");
+          else console.error(message);
+        } finally {
+          await shutdownManager();
+          activeClients.clear();
+          updateLspStatus();
+        }
         return;
       }
 

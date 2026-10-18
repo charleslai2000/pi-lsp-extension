@@ -57,9 +57,11 @@ import { getOrCreateTreeSitterManager } from "./tree-sitter-wasm-core.js";
 
 // Config
 const INIT_TIMEOUT_MS = 30000;
+export const DIAGNOSTIC_REQUEST_TIMEOUT_MS = 5000;
 const MAX_OPEN_FILES = 30;
 const IDLE_TIMEOUT_MS = 60_000;
 const CLEANUP_INTERVAL_MS = 30_000;
+const ACTIVE_DOCUMENT_DIAGNOSTICS_TIMEOUT_MS = 10_000;
 
 export const LANGUAGE_IDS: Record<string, string> = {
   ".dart": "dart", ".ts": "typescript", ".tsx": "typescriptreact",
@@ -213,6 +215,27 @@ function timeout<T>(promise: Promise<T>, ms: number, name: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${name} timed out`)), ms);
     promise.then(r => { clearTimeout(timer); resolve(r); }, e => { clearTimeout(timer); reject(e); });
+  });
+}
+
+function diagnosticTimeoutMs(signal: AbortSignal | undefined, startedAt: number, fallbackMs: number): number {
+  if (!signal) return fallbackMs;
+  return Math.max(1, Math.min(fallbackMs, startedAt - Date.now()));
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new Error("Aborted"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(new Error("Aborted"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      value => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      error => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
   });
 }
 
@@ -1327,8 +1350,8 @@ export class LSPManager {
     });
   }
 
-  private async pullDiagnostics(client: LSPClient, absPath: string, uri: string): Promise<{ diagnostics: Diagnostic[]; responded: boolean }> {
-    if (client.closed) return { diagnostics: [], responded: false };
+  async pullDiagnostics(client: LSPClient, absPath: string, uri: string, signal?: AbortSignal): Promise<{ diagnostics: Diagnostic[]; responded: boolean; aborted?: boolean }> {
+    if (client.closed || signal?.aborted) return { diagnostics: [], responded: false };
 
     // Only attempt Pull Diagnostics if the server advertises support.
     // (Some servers throw and log noisy errors if we call these methods.)
@@ -1336,11 +1359,17 @@ export class LSPManager {
       return { diagnostics: [], responded: false };
     }
 
+    const startedAt = signal ? Date.now() + 5_000 : 0;
+
     // Prefer new Pull Diagnostics if supported by the server
     try {
-      const res: any = await client.connection.sendRequest(DocumentDiagnosticRequest.method, {
-        textDocument: { uri },
-      });
+      const res: any = await timeout(
+        abortable(client.connection.sendRequest(DocumentDiagnosticRequest.method, {
+          textDocument: { uri },
+        }), signal),
+        diagnosticTimeoutMs(signal, startedAt, DIAGNOSTIC_REQUEST_TIMEOUT_MS),
+        `${client.serverId} document diagnostics`,
+      );
 
       if (res?.kind === DocumentDiagnosticReportKind.Full) {
         return { diagnostics: Array.isArray(res.items) ? res.items : [], responded: true };
@@ -1352,15 +1381,22 @@ export class LSPManager {
         return { diagnostics: res.items, responded: true };
       }
       return { diagnostics: [], responded: true };
-    } catch {
-      // ignore
+    } catch (error) {
+      try { client.connection.sendNotification("$/cancelRequest", {}); } catch {}
+      if (signal?.aborted || (error instanceof Error && error.message === "Aborted")) {
+        return { diagnostics: [], responded: false, aborted: true };
+      }
     }
 
     // Fallback: some servers only support WorkspaceDiagnosticRequest
     try {
-      const res: any = await client.connection.sendRequest(WorkspaceDiagnosticRequest.method, {
-        previousResultIds: [],
-      });
+      const res: any = await timeout(
+        abortable(client.connection.sendRequest(WorkspaceDiagnosticRequest.method, {
+          previousResultIds: [],
+        }), signal),
+        diagnosticTimeoutMs(signal, startedAt, DIAGNOSTIC_REQUEST_TIMEOUT_MS),
+        `${client.serverId} workspace diagnostics`,
+      );
 
       const items: any[] = res?.items || [];
       const match = items.find((it: any) => it?.uri === uri);
@@ -1371,19 +1407,25 @@ export class LSPManager {
         return { diagnostics: match.items, responded: true };
       }
       return { diagnostics: [], responded: true };
-    } catch {
+    } catch (error) {
+      try { client.connection.sendNotification("$/cancelRequest", {}); } catch {}
+      if (signal?.aborted || (error instanceof Error && error.message === "Aborted")) {
+        return { diagnostics: [], responded: false, aborted: true };
+      }
       return { diagnostics: [], responded: false };
     }
   }
 
-  async touchFileAndWait(filePath: string, timeoutMs: number): Promise<{ diagnostics: Diagnostic[]; receivedResponse: boolean; unsupported?: boolean; error?: string }> {
+  async touchFileAndWait(filePath: string, timeoutMs: number, signal?: AbortSignal): Promise<{ diagnostics: Diagnostic[]; receivedResponse: boolean; unsupported?: boolean; error?: string }> {
     const absPath = this.resolve(filePath);
 
+    if (signal?.aborted) return { diagnostics: [], receivedResponse: false, error: "Aborted" };
     if (!fs.existsSync(absPath)) {
       return { diagnostics: [], receivedResponse: false, unsupported: true, error: "File not found" };
     }
 
     const clients = await this.getClientsForFile(absPath);
+    if (signal?.aborted) return { diagnostics: [], receivedResponse: false, error: "Aborted" };
     if (!clients.length) {
       const treeSitter = getOrCreateTreeSitterManager();
       if (treeSitter.supportsOperation(absPath, "diagnostics")) {
@@ -1401,11 +1443,23 @@ export class LSPManager {
     const langId = this.langId(absPath);
     const isNew = clients.some(c => !c.openFiles.has(absPath));
 
-    const waits = clients.map(c => this.waitForDiagnostics(c, absPath, timeoutMs, isNew));
+    const boundedWaitMs = Math.min(timeoutMs, ACTIVE_DOCUMENT_DIAGNOSTICS_TIMEOUT_MS);
+    const waits = clients.map(c => this.waitForDiagnostics(c, absPath, boundedWaitMs, isNew));
+    let abortListener: (() => void) | undefined;
+    const aborted = signal ? new Promise<boolean>(resolve => {
+      if (signal.aborted) return resolve(true);
+      abortListener = () => resolve(true);
+      signal.addEventListener("abort", abortListener, { once: true });
+    }) : undefined;
     await this.openOrUpdate(clients, absPath, uri, langId, content);
-    const results = await Promise.all(waits);
+    const results = await Promise.race([
+      Promise.all(waits).then(value => ({ value, wasAborted: false })),
+      ...(aborted ? [aborted.then(() => ({ value: [] as boolean[], wasAborted: true }))] : []),
+    ]);
+    if (abortListener) signal?.removeEventListener("abort", abortListener);
+    if (results.wasAborted) return { diagnostics: [], receivedResponse: false, error: "Aborted" };
 
-    let responded = results.some(r => r);
+    let responded = results.value.some(r => r);
     const diags: Diagnostic[] = [];
     for (const c of clients) {
       const d = c.diagnostics.get(absPath);
@@ -1415,7 +1469,9 @@ export class LSPManager {
 
     // If we didn't get pushed diagnostics (common for some servers), try pull diagnostics.
     if (!responded || diags.length === 0) {
-      const pulled = await Promise.all(clients.map(c => this.pullDiagnostics(c, absPath, uri)));
+      if (signal?.aborted) return { diagnostics: diags, receivedResponse: responded, error: "Aborted" };
+      const pulled = await Promise.all(clients.map(c => this.pullDiagnostics(c, absPath, uri, signal)));
+      if (pulled.some(result => result.aborted)) return { diagnostics: diags, receivedResponse: responded, error: "Aborted" };
       for (let i = 0; i < clients.length; i++) {
         const r = pulled[i];
         if (r.responded) responded = true;

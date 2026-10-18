@@ -3761,6 +3761,32 @@ path = /tmp
 	);
 });
 
+test("LSPManager: bounds stalled document and workspace diagnostic requests", async () => {
+	const manager = new LSPManager(tmpdir());
+	const file = join(tmpdir(), "stalled-diagnostics.ts");
+	const methods: string[] = [];
+	const client = {
+		serverId: "fixture-lsp",
+		closed: false,
+		capabilities: { diagnosticProvider: {} },
+		diagnostics: new Map(),
+		connection: { sendRequest: async (method: string) => { methods.push(method); return new Promise(() => {}); } },
+	} as any;
+	try {
+		const startedAt = Date.now();
+		const controller = new AbortController();
+		const abortTimer = setTimeout(() => controller.abort(), 1000);
+		const result = await manager.pullDiagnostics(client, file, pathToFileURL(file).href, controller.signal);
+		clearTimeout(abortTimer);
+		assert(Date.now() - startedAt < 2500, "Aborting a stalled document request must not start workspace fallback");
+		assert(!result.responded, "An aborted diagnostic request must not be reported as a response");
+		assert(result.aborted === true, "Aborted document diagnostic should report cancellation");
+		assertEquals(JSON.stringify(methods), JSON.stringify(["textDocument/diagnostic"]), "Workspace fallback must stop after abort");
+	} finally {
+		await manager.shutdown();
+	}
+});
+
 test("LSPManager: falls back to Tree-sitter diagnostics without LSP root", async () => {
 	await withTempDir(
 		{

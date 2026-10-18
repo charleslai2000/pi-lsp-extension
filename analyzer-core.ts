@@ -875,7 +875,7 @@ export function getAnalyzerConfigsForFile(filePath: string, cwd: string = proces
   });
 }
 
-function runCommand(command: AnalyzerCommand): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
+function runCommand(command: AnalyzerCommand, signal?: AbortSignal): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     try {
       const child = spawn(command.command, command.args, {
@@ -885,17 +885,31 @@ function runCommand(command: AnalyzerCommand): Promise<{ code: number | null; si
       });
       let stdout = "";
       let stderr = "";
+      const abort = () => {
+        if (!child.kill("SIGTERM")) return;
+        const forceTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+        (forceTimer as any).unref?.();
+        child.once("exit", () => clearTimeout(forceTimer));
+      };
+      if (signal?.aborted) abort();
+      else signal?.addEventListener("abort", abort, { once: true });
       child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf-8"); });
       child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf-8"); });
-      child.once("error", reject);
-      child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+      child.once("error", (error) => {
+        signal?.removeEventListener("abort", abort);
+        reject(error);
+      });
+      child.once("exit", (code, exitSignal) => {
+        signal?.removeEventListener("abort", abort);
+        resolve({ code, signal: exitSignal, stdout, stderr });
+      });
     } catch (error) {
       reject(error);
     }
   });
 }
 
-export async function runAnalyzersForFile(filePath: string, cwd: string): Promise<AnalyzerRunResult> {
+export async function runAnalyzersForFile(filePath: string, cwd: string, signal?: AbortSignal): Promise<AnalyzerRunResult> {
   const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
   if (!fs.existsSync(absPath)) return { findings: [], skipped: "file_missing" };
 
@@ -919,7 +933,7 @@ export async function runAnalyzersForFile(filePath: string, cwd: string): Promis
     analyzerIds.push(analyzer.id);
 
 		try {
-			const result = await runCommand(command);
+			const result = await runCommand(command, signal);
 			const parseSource = result.stdout.trim() ? result.stdout : result.stderr;
 			const parsedFromStderr = !result.stdout.trim() && result.stderr.trim().length > 0;
 			const parsedFindings = analyzer.parseOutput(parseSource, absPath, command).filter((finding) => finding.filePath === "" || path.resolve(finding.filePath) === absPath);
