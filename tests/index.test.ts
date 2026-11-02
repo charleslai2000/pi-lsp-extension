@@ -34,7 +34,7 @@ import {
   formatPrepareCallHierarchyResult,
   formatWorkspaceSymbolResult,
 } from "../lsp-tool-formatters.js";
-import { buildOperationSummary, withBackendLabel } from "../lsp-tool.js";
+import { buildOperationSummary, withBackendLabel, withTimeout } from "../lsp-tool.js";
 import { lspToolParameters, safeParseLspToolInput } from "../lsp-tool-schemas.js";
 import { Value } from "@sinclair/typebox/value";
 import { extractApplyPatchPaths, extractBashRedirectionPaths, selectPendingDiagnosticsForConfig } from "../lsp.js";
@@ -42,6 +42,51 @@ import { extractApplyPatchPaths, extractBashRedirectionPaths, selectPendingDiagn
 // ============================================================================
 // uriToPath tests
 // ============================================================================
+
+test("withTimeout: rejects a stalled LSP operation", async () => {
+  const started = Date.now();
+  let timedOut = false;
+  try {
+    await withTimeout(() => new Promise<never>(() => {}), 10, "workspaceSymbol");
+  } catch (error) {
+    timedOut = error instanceof Error && error.message === "workspaceSymbol timed out after 10ms";
+  }
+  assertEqual(timedOut, true, "Expected stalled request to return a timeout error");
+  assertEqual(Date.now() - started < 1000, true, "Timeout should be bounded");
+});
+
+test("withTimeout: preserves a completed LSP result", async () => {
+  assertEqual(await withTimeout(() => Promise.resolve("ok"), 100, "workspaceSymbol"), "ok");
+});
+
+test("withTimeout: cancels the underlying LSP request on timeout", async () => {
+  let cancelled = false;
+  let timedOut = false;
+  try {
+    await withTimeout((token) => {
+      token.onCancellationRequested(() => { cancelled = true; });
+      return new Promise<never>(() => {});
+    }, 10, "workspaceSymbol");
+  } catch (error) {
+    timedOut = error instanceof Error && error.message === "workspaceSymbol timed out after 10ms";
+  }
+  assertEqual(timedOut, true, "Expected timeout error");
+  assertEqual(cancelled, true, "Timeout must cancel the JSON-RPC request token");
+});
+
+test("withTimeout: cancels the LSP request when the caller aborts", async () => {
+  const controller = new AbortController();
+  let cancelled = false;
+  let rejected = false;
+  const request = withTimeout((token) => {
+    token.onCancellationRequested(() => { cancelled = true; });
+    return new Promise<never>(() => {});
+  }, 1000, "workspaceSymbol", controller.signal).catch(() => { rejected = true; });
+  controller.abort();
+  await request;
+  assertEqual(cancelled, true, "Caller abort must cancel the JSON-RPC request token");
+  assertEqual(rejected, true, "Caller abort must settle the tool request");
+});
 
 test("uriToPath: converts file:// URI to path", () => {
   const result = uriToPath("file:///Users/test/file.ts");

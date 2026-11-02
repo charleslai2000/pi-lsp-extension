@@ -2,6 +2,7 @@ import { open } from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
+import { CancellationTokenSource } from "vscode-languageserver-protocol";
 import type {
 	CallHierarchyIncomingCall,
 	CallHierarchyItem,
@@ -52,6 +53,7 @@ import { getDapSessionManager } from "./dap/_engine.js";
 const PREVIEW_LINES = 10;
 const MAX_LSP_FILE_SIZE_BYTES = 10_000_000;
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
+const WORKSPACE_SYMBOL_TIMEOUT_MS = 30_000;
 
 const LspParams = lspToolParameters;
 
@@ -130,6 +132,47 @@ function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 
 function isAbortedError(error: unknown): boolean {
 	return error instanceof Error && error.message === "aborted";
+}
+
+export function withTimeout<T>(
+	operation: (token: import("vscode-languageserver-protocol").CancellationToken) => Promise<T>,
+	timeoutMs: number,
+	name: string,
+	signal?: AbortSignal,
+): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		const cancellation = new CancellationTokenSource();
+		let settled = false;
+		const finish = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			cancellation.dispose();
+			callback();
+		};
+		const onAbort = () => {
+			cancellation.cancel();
+			finish(() => reject(new Error("aborted")));
+		};
+		const timer = setTimeout(() => {
+			cancellation.cancel();
+			finish(() => reject(new Error(`${name} timed out after ${timeoutMs}ms`)));
+		}, timeoutMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
+		try {
+			operation(cancellation.token).then(
+				(value) => finish(() => resolve(value)),
+				(error) => finish(() => reject(error)),
+			);
+		} catch (error) {
+			finish(() => reject(error));
+		}
+	});
 }
 
 function cancelledToolResult(): {
@@ -972,7 +1015,12 @@ export default function (pi: ExtensionAPI) {
 								break;
 							case "workspaceSymbol":
 								result = await abortable(
-									manager.getWorkspaceSymbols(params.filePath!),
+									withTimeout(
+										(token) => manager.getWorkspaceSymbols(params.filePath!, "", token),
+										WORKSPACE_SYMBOL_TIMEOUT_MS,
+										"workspaceSymbol",
+										signal,
+									),
 									signal,
 								);
 								break;

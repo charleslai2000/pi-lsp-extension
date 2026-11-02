@@ -30,6 +30,7 @@ import {
   RenameRequest,
   CodeActionRequest,
 } from "vscode-languageserver-protocol/node.js";
+import { CancellationTokenSource, type CancellationToken } from "vscode-jsonrpc";
 import {
   type CallHierarchyIncomingCall,
   type CallHierarchyItem,
@@ -1689,7 +1690,7 @@ export class LSPManager {
     return results.flat();
   }
 
-  async getWorkspaceSymbols(fp: string, query = ""): Promise<SymbolInformation[]> {
+  async getWorkspaceSymbols(fp: string, query = "", token?: CancellationToken): Promise<SymbolInformation[]> {
     const absPath = this.resolve(fp);
     const clients = await this.getClientsForFile(absPath);
     if (!clients.length) return getOrCreateTreeSitterManager().getWorkspaceSymbols(absPath, query);
@@ -1699,8 +1700,25 @@ export class LSPManager {
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
       try {
-        const response = await c.connection.sendRequest("workspace/symbol", { query });
-        return Array.isArray(response) ? response as SymbolInformation[] : [];
+        const requestCancellation = new CancellationTokenSource();
+        const onAbort = () => requestCancellation.cancel();
+        const subscription = token?.onCancellationRequested(onAbort);
+        try {
+          const request = c.connection.sendRequest("workspace/symbol", { query }, requestCancellation.token);
+          if (token) {
+            const cancelled = new Promise<never>((_, reject) => {
+              if (token.isCancellationRequested) reject(new Error("Request cancelled"));
+              else token.onCancellationRequested(() => reject(new Error("Request cancelled")));
+            });
+            const response = await Promise.race([request, cancelled]);
+            return Array.isArray(response) ? response as SymbolInformation[] : [];
+          }
+          const response = await request;
+          return Array.isArray(response) ? response as SymbolInformation[] : [];
+        } finally {
+          subscription?.dispose();
+          requestCancellation.dispose();
+        }
       } catch {
         return [];
       }
