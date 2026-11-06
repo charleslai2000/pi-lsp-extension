@@ -1047,6 +1047,40 @@ export class LSPManager {
     return clients.filter(client => !client.closed && this.supportsOperationForClient(client, operation));
   }
 
+  private async sendCancellableRequest<T, R = T>(
+    client: LSPClient,
+    method: string,
+    params: unknown,
+    token?: CancellationToken,
+    mapResult?: (value: T) => R,
+  ): Promise<R> {
+    if (!token) {
+      const result = await client.connection.sendRequest(method, params);
+      return mapResult ? mapResult(result as T) : result as R;
+    }
+    if (token.isCancellationRequested) throw new Error("Request cancelled");
+    const requestCancellation = new CancellationTokenSource();
+    const subscription = token.onCancellationRequested(() => requestCancellation.cancel());
+    try {
+      const request = client.connection.sendRequest(method, params, requestCancellation.token) as Promise<T>;
+      let cancellationSubscription: { dispose: () => void } | undefined;
+      const cancelled = new Promise<never>((_, reject) => {
+        if (token.isCancellationRequested) reject(new Error("Request cancelled"));
+        else cancellationSubscription = token.onCancellationRequested(() => reject(new Error("Request cancelled")));
+      });
+      try {
+        const result = await Promise.race([request, cancelled]);
+        return mapResult ? mapResult(result) : result as unknown as R;
+      } finally {
+        cancellationSubscription?.dispose();
+        void request.catch(() => {});
+      }
+    } finally {
+      subscription.dispose();
+      requestCancellation.dispose();
+    }
+  }
+
   private positionAt(text: string, offset: number): { line: number; character: number } {
     let line = 0;
     let character = 0;
@@ -1274,6 +1308,7 @@ export class LSPManager {
     method: string,
     params: unknown,
     strategy: "all" | "first" = "all",
+    token?: CancellationToken,
   ): Promise<T | undefined> {
     const absPath = this.resolve(filePath);
     const clients = await this.getClientsForFile(absPath);
@@ -1285,7 +1320,7 @@ export class LSPManager {
     for (const client of clients) {
       if (client.closed) continue;
       try {
-        const result = await client.connection.sendRequest(method, params);
+        const result = await this.sendCancellableRequest<T>(client, method, params, token);
         sawSuccess = true;
         if (strategy === "first") {
           return result as T;
@@ -1563,7 +1598,7 @@ export class LSPManager {
     return { items: results };
   }
 
-  async getDefinition(fp: string, line: number, col: number): Promise<Location[]> {
+  async getDefinition(fp: string, line: number, col: number, token?: CancellationToken): Promise<Location[]> {
     const l = await this.loadFile(fp);
     if (!l) return getOrCreateTreeSitterManager().getDefinition(this.resolve(fp), line, col);
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1571,9 +1606,12 @@ export class LSPManager {
     const supportedClients = this.getSupportedClients(l.clients, "goToDefinition");
     if (!supportedClients.length) return getOrCreateTreeSitterManager().getDefinition(l.absPath, line, col);
     const results = await Promise.all(supportedClients.map(async c => {
-      if (c.closed) return [];
-      try { return this.normalizeLocs(await c.connection.sendRequest(DefinitionRequest.type, { textDocument: { uri: l.uri }, position: pos })); }
-      catch { return []; }
+      if (c.closed || token?.isCancellationRequested) return [];
+      try {
+        return await this.sendCancellableRequest<Location[]>(c, DefinitionRequest.type, { textDocument: { uri: l.uri }, position: pos }, token, result => this.normalizeLocs(result));
+      } catch {
+        return [];
+      }
     }));
     const flattened = results.flat();
     if (this.shouldUseMarkdownFallback(l.absPath) && (flattened.length === 0 || flattened.every((location) => !this.locationHasMeaningfulRange(location)))) {
@@ -1582,7 +1620,7 @@ export class LSPManager {
     return flattened;
   }
 
-  async getReferences(fp: string, line: number, col: number): Promise<Location[]> {
+  async getReferences(fp: string, line: number, col: number, token?: CancellationToken): Promise<Location[]> {
     const l = await this.loadFile(fp);
     if (!l) return getOrCreateTreeSitterManager().getReferences(this.resolve(fp), line, col);
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1590,9 +1628,8 @@ export class LSPManager {
     const supportedClients = this.getSupportedClients(l.clients, "findReferences");
     if (!supportedClients.length) return getOrCreateTreeSitterManager().getReferences(l.absPath, line, col);
     const results = await Promise.all(supportedClients.map(async c => {
-      if (c.closed) return [];
-      try { return this.normalizeLocs(await c.connection.sendRequest(ReferencesRequest.type, { textDocument: { uri: l.uri }, position: pos, context: { includeDeclaration: true } })); }
-      catch { return []; }
+      if (c.closed || token?.isCancellationRequested) return [];
+      return this.sendCancellableRequest<Location[]>(c, ReferencesRequest.type, { textDocument: { uri: l.uri }, position: pos, context: { includeDeclaration: true } }, token, result => this.normalizeLocs(result));
     }));
     const flattened = results.flat();
     if (this.shouldUseMarkdownFallback(l.absPath) && flattened.length === 0) {
@@ -1601,7 +1638,7 @@ export class LSPManager {
     return flattened;
   }
 
-  async getHover(fp: string, line: number, col: number): Promise<Hover | null> {
+  async getHover(fp: string, line: number, col: number, token?: CancellationToken): Promise<Hover | null> {
     const l = await this.loadFile(fp);
     if (!l) {
       const absPath = this.resolve(fp);
@@ -1613,7 +1650,7 @@ export class LSPManager {
     for (const c of this.getSupportedClients(l.clients, "hover")) {
       if (c.closed) continue;
       try {
-        const r = await c.connection.sendRequest(HoverRequest.type, { textDocument: { uri: l.uri }, position: pos });
+        const r = await this.sendCancellableRequest<Hover | null>(c, HoverRequest.type, { textDocument: { uri: l.uri }, position: pos }, token);
         if (r) {
           const hoverText = this.hoverToText(r);
           if (!(this.shouldUseMarkdownFallback(l.absPath) && hoverText.includes("Heading not found"))) {
@@ -1627,20 +1664,20 @@ export class LSPManager {
     return treeSitterHover ?? await getDevDocsHover(l.absPath, line, col);
   }
 
-  async getSignatureHelp(fp: string, line: number, col: number): Promise<SignatureHelp | null> {
+  async getSignatureHelp(fp: string, line: number, col: number, token?: CancellationToken): Promise<SignatureHelp | null> {
     const l = await this.loadFile(fp);
     if (!l) return null;
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
     const pos = this.toPos(line, col);
     for (const c of this.getSupportedClients(l.clients, "signatureHelp")) {
       if (c.closed) continue;
-      try { const r = await c.connection.sendRequest(SignatureHelpRequest.type, { textDocument: { uri: l.uri }, position: pos }); if (r) return r; }
+      try { const r = await this.sendCancellableRequest<SignatureHelp | null>(c, SignatureHelpRequest.type, { textDocument: { uri: l.uri }, position: pos }, token); if (r) return r; }
       catch {}
     }
     return null;
   }
 
-  async getDocumentSymbols(fp: string): Promise<DocumentSymbol[]> {
+  async getDocumentSymbols(fp: string, token?: CancellationToken): Promise<DocumentSymbol[]> {
     const l = await this.loadFile(fp);
     if (!l) return getOrCreateTreeSitterManager().getDocumentSymbols(this.resolve(fp));
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1648,13 +1685,13 @@ export class LSPManager {
     if (!supportedClients.length) return getOrCreateTreeSitterManager().getDocumentSymbols(l.absPath);
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
-      try { return this.normalizeSymbols(await c.connection.sendRequest(DocumentSymbolRequest.type, { textDocument: { uri: l.uri } })); }
+      try { return await this.sendCancellableRequest<DocumentSymbol[]>(c, DocumentSymbolRequest.type, { textDocument: { uri: l.uri } }, token, result => this.normalizeSymbols(result)); }
       catch { return []; }
     }));
     return results.flat();
   }
 
-  async getDocumentHighlights(fp: string, line: number, col: number): Promise<DocumentHighlight[]> {
+  async getDocumentHighlights(fp: string, line: number, col: number, token?: CancellationToken): Promise<DocumentHighlight[]> {
     const l = await this.loadFile(fp);
     if (!l) return getOrCreateTreeSitterManager().getDocumentHighlights(this.resolve(fp), line, col);
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1664,10 +1701,10 @@ export class LSPManager {
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
       try {
-        const response = await c.connection.sendRequest(DocumentHighlightRequest.type, {
+        const response = await this.sendCancellableRequest<DocumentHighlight[] | null>(c, DocumentHighlightRequest.type, {
           textDocument: { uri: l.uri },
           position: pos,
-        });
+        }, token);
         return Array.isArray(response) ? response as DocumentHighlight[] : [];
       } catch {
         return [];
@@ -1676,7 +1713,7 @@ export class LSPManager {
     return results.flat();
   }
 
-  async getImplementation(fp: string, line: number, col: number): Promise<Location[]> {
+  async getImplementation(fp: string, line: number, col: number, token?: CancellationToken): Promise<Location[]> {
     const l = await this.loadFile(fp);
     if (!l) return [];
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1684,7 +1721,7 @@ export class LSPManager {
     const supportedClients = this.getSupportedClients(l.clients, "goToImplementation");
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
-      try { return this.normalizeLocs(await c.connection.sendRequest("textDocument/implementation", { textDocument: { uri: l.uri }, position: pos })); }
+      try { return await this.sendCancellableRequest<Location[]>(c, "textDocument/implementation", { textDocument: { uri: l.uri }, position: pos }, token, result => this.normalizeLocs(result)); }
       catch { return []; }
     }));
     return results.flat();
@@ -1700,25 +1737,8 @@ export class LSPManager {
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
       try {
-        const requestCancellation = new CancellationTokenSource();
-        const onAbort = () => requestCancellation.cancel();
-        const subscription = token?.onCancellationRequested(onAbort);
-        try {
-          const request = c.connection.sendRequest("workspace/symbol", { query }, requestCancellation.token);
-          if (token) {
-            const cancelled = new Promise<never>((_, reject) => {
-              if (token.isCancellationRequested) reject(new Error("Request cancelled"));
-              else token.onCancellationRequested(() => reject(new Error("Request cancelled")));
-            });
-            const response = await Promise.race([request, cancelled]);
-            return Array.isArray(response) ? response as SymbolInformation[] : [];
-          }
-          const response = await request;
-          return Array.isArray(response) ? response as SymbolInformation[] : [];
-        } finally {
-          subscription?.dispose();
-          requestCancellation.dispose();
-        }
+        const response = await this.sendCancellableRequest<SymbolInformation[] | null>(c, "workspace/symbol", { query }, token);
+        return Array.isArray(response) ? response : [];
       } catch {
         return [];
       }
@@ -1727,7 +1747,7 @@ export class LSPManager {
     return results.flat();
   }
 
-  async getFoldingRanges(fp: string): Promise<FoldingRange[]> {
+  async getFoldingRanges(fp: string, token?: CancellationToken): Promise<FoldingRange[]> {
     const l = await this.loadFile(fp);
     if (!l) return getOrCreateTreeSitterManager().getFoldingRanges(this.resolve(fp));
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1736,9 +1756,9 @@ export class LSPManager {
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
       try {
-        const response = await c.connection.sendRequest(FoldingRangeRequest.type, {
+        const response = await this.sendCancellableRequest<FoldingRange[] | null>(c, FoldingRangeRequest.type, {
           textDocument: { uri: l.uri },
-        });
+        }, token);
         return Array.isArray(response) ? response as FoldingRange[] : [];
       } catch {
         return [];
@@ -1747,7 +1767,7 @@ export class LSPManager {
     return results.flat();
   }
 
-  async prepareCallHierarchy(fp: string, line: number, col: number): Promise<CallHierarchyItem[]> {
+  async prepareCallHierarchy(fp: string, line: number, col: number, token?: CancellationToken): Promise<CallHierarchyItem[]> {
     const l = await this.loadFile(fp);
     if (!l) return [];
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1756,10 +1776,10 @@ export class LSPManager {
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
       try {
-        const response = await c.connection.sendRequest("textDocument/prepareCallHierarchy", {
+        const response = await this.sendCancellableRequest<CallHierarchyItem[] | null>(c, "textDocument/prepareCallHierarchy", {
           textDocument: { uri: l.uri },
           position: pos,
-        });
+        }, token);
         return Array.isArray(response) ? response as CallHierarchyItem[] : [];
       } catch {
         return [];
@@ -1768,7 +1788,7 @@ export class LSPManager {
     return results.flat();
   }
 
-  async getIncomingCalls(item: CallHierarchyItem): Promise<CallHierarchyIncomingCall[]> {
+  async getIncomingCalls(item: CallHierarchyItem, token?: CancellationToken): Promise<CallHierarchyIncomingCall[]> {
     const absPath = this.resolve(uriToPath(item.uri));
     const clients = await this.getClientsForFile(absPath);
     if (!clients.length) return [];
@@ -1777,7 +1797,7 @@ export class LSPManager {
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
       try {
-        const response = await c.connection.sendRequest("callHierarchy/incomingCalls", { item });
+        const response = await this.sendCancellableRequest<CallHierarchyIncomingCall[] | null>(c, "callHierarchy/incomingCalls", { item }, token);
         return Array.isArray(response) ? response as CallHierarchyIncomingCall[] : [];
       } catch {
         return [];
@@ -1786,7 +1806,7 @@ export class LSPManager {
     return results.flat();
   }
 
-  async getOutgoingCalls(item: CallHierarchyItem): Promise<CallHierarchyOutgoingCall[]> {
+  async getOutgoingCalls(item: CallHierarchyItem, token?: CancellationToken): Promise<CallHierarchyOutgoingCall[]> {
     const absPath = this.resolve(uriToPath(item.uri));
     const clients = await this.getClientsForFile(absPath);
     if (!clients.length) return [];
@@ -1795,7 +1815,7 @@ export class LSPManager {
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
       try {
-        const response = await c.connection.sendRequest("callHierarchy/outgoingCalls", { item });
+        const response = await this.sendCancellableRequest<CallHierarchyOutgoingCall[] | null>(c, "callHierarchy/outgoingCalls", { item }, token);
         return Array.isArray(response) ? response as CallHierarchyOutgoingCall[] : [];
       } catch {
         return [];
@@ -1804,7 +1824,7 @@ export class LSPManager {
     return results.flat();
   }
 
-  async rename(fp: string, line: number, col: number, newName: string): Promise<WorkspaceEdit | null> {
+  async rename(fp: string, line: number, col: number, newName: string, token?: CancellationToken): Promise<WorkspaceEdit | null> {
     const l = await this.loadFile(fp);
     if (!l) return null;
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1812,18 +1832,18 @@ export class LSPManager {
     for (const c of this.getSupportedClients(l.clients, "rename")) {
       if (c.closed) continue;
       try {
-        const r = await c.connection.sendRequest(RenameRequest.type, {
+        const r = await this.sendCancellableRequest<WorkspaceEdit | null>(c, RenameRequest.type, {
           textDocument: { uri: l.uri },
           position: pos,
           newName,
-        });
+        }, token);
         if (r) return r;
       } catch {}
     }
     return null;
   }
 
-  async getCodeActions(fp: string, startLine: number, startCol: number, endLine?: number, endCol?: number): Promise<(CodeAction | Command)[]> {
+  async getCodeActions(fp: string, startLine: number, startCol: number, endLine?: number, endCol?: number, token?: CancellationToken): Promise<(CodeAction | Command)[]> {
     const l = await this.loadFile(fp);
     if (!l) return [];
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1845,18 +1865,18 @@ export class LSPManager {
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
       try {
-        const r = await c.connection.sendRequest(CodeActionRequest.type, {
+        const r = await this.sendCancellableRequest<(CodeAction | Command)[] | null>(c, CodeActionRequest.type, {
           textDocument: { uri: l.uri },
           range,
           context: { diagnostics, only: [CodeActionKind.QuickFix, CodeActionKind.Refactor, CodeActionKind.Source] },
-        });
+        }, token);
         return r || [];
       } catch { return []; }
     }));
     return results.flat();
   }
 
-  async getTypeDefinition(fp: string, line: number, col: number): Promise<Location[]> {
+  async getTypeDefinition(fp: string, line: number, col: number, token?: CancellationToken): Promise<Location[]> {
     const l = await this.loadFile(fp);
     if (!l) return [];
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1864,13 +1884,13 @@ export class LSPManager {
     const supportedClients = this.getSupportedClients(l.clients, "typeDefinition");
     const results = await Promise.all(supportedClients.map(async c => {
       if (c.closed) return [];
-      try { return this.normalizeLocs(await c.connection.sendRequest("textDocument/typeDefinition", { textDocument: { uri: l.uri }, position: pos })); }
+      try { return await this.sendCancellableRequest<Location[]>(c, "textDocument/typeDefinition", { textDocument: { uri: l.uri }, position: pos }, token, result => this.normalizeLocs(result)); }
       catch { return []; }
     }));
     return results.flat();
   }
 
-  async prepareRename(fp: string, line: number, col: number): Promise<{ placeholder?: string; range: { start: { line: number; character: number }; end: { line: number; character: number } } } | null> {
+  async prepareRename(fp: string, line: number, col: number, token?: CancellationToken): Promise<{ placeholder?: string; range: { start: { line: number; character: number }; end: { line: number; character: number } } } | null> {
     const l = await this.loadFile(fp);
     if (!l) return null;
     await this.openOrUpdate(l.clients, l.absPath, l.uri, l.langId, l.content);
@@ -1878,10 +1898,10 @@ export class LSPManager {
     for (const c of this.getSupportedClients(l.clients, "prepareRename")) {
       if (c.closed) continue;
       try {
-        const result = await c.connection.sendRequest("textDocument/prepareRename", {
+        const result = await this.sendCancellableRequest<{ placeholder?: string; range?: { start: { line: number; character: number }; end: { line: number; character: number } } } | { start: { line: number; character: number }; end: { line: number; character: number } } | null>(c, "textDocument/prepareRename", {
           textDocument: { uri: l.uri },
           position: pos,
-        }) as { placeholder?: string; range?: { start: { line: number; character: number }; end: { line: number; character: number } } } | { start: { line: number; character: number }; end: { line: number; character: number } } | null;
+        }, token);
         if (!result) continue;
         if ("range" in result && result.range) return { range: result.range, placeholder: result.placeholder };
         if ("start" in result && "end" in result) return { range: result };

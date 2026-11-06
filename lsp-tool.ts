@@ -54,6 +54,8 @@ const PREVIEW_LINES = 10;
 const MAX_LSP_FILE_SIZE_BYTES = 10_000_000;
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
 const WORKSPACE_SYMBOL_TIMEOUT_MS = 30_000;
+const INTERACTIVE_LSP_REQUEST_TIMEOUT_MS = 30_000;
+const DIAGNOSTICS_OPERATION_TIMEOUT_MS = 30_000;
 
 const LspParams = lspToolParameters;
 
@@ -810,11 +812,13 @@ export default function (pi: ExtensionAPI) {
 								manager.getOperationBackend(params.filePath!, params.operation),
 								signal,
 							)) ?? undefined;
-						const result = await abortable(
-							manager.touchFileAndWait(
+						const result = await withTimeout(
+							() => manager.touchFileAndWait(
 								params.filePath!,
 								diagnosticsWaitMsForFile(params.filePath!),
 							),
+							DIAGNOSTICS_OPERATION_TIMEOUT_MS,
+							"diagnostics",
 							signal,
 						);
 						const diagnostics = filterDiagnosticsBySeverity(
@@ -850,8 +854,10 @@ export default function (pi: ExtensionAPI) {
 						const waitMs = Math.max(
 							...params.filePaths!.map(diagnosticsWaitMsForFile),
 						);
-						const result = await abortable(
-							manager.getDiagnosticsForFiles(params.filePaths!, waitMs),
+						const result = await withTimeout(
+							() => manager.getDiagnosticsForFiles(params.filePaths!, waitMs),
+							DIAGNOSTICS_OPERATION_TIMEOUT_MS,
+							"workspaceDiagnostics",
 							signal,
 						);
 						formatted = {
@@ -927,12 +933,10 @@ export default function (pi: ExtensionAPI) {
 						let result: unknown;
 						switch (params.operation) {
 							case "setBreakpoint": {
-								const defResult = await abortable(
-									manager.getDefinition(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								const defResult = await withTimeout(
+									(token) => manager.getDefinition(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"setBreakpoint definition lookup",
 									signal,
 								);
 								const rawItems = Array.isArray(defResult) ? defResult : defResult ? [defResult] : [];
@@ -968,48 +972,47 @@ export default function (pi: ExtensionAPI) {
 								}
 							}
 							case "goToDefinition":
-								result = await abortable(
-									manager.getDefinition(
+								result = await withTimeout(
+									(token) => manager.getDefinition(
 										params.filePath!,
 										params.line!,
 										params.character!,
+										token,
 									),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"goToDefinition",
 									signal,
 								);
 								break;
 							case "findReferences":
-								result = await abortable(
-									manager.getReferences(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								result = await withTimeout(
+									(token) => manager.getReferences(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"findReferences",
 									signal,
 								);
 								break;
 							case "hover":
-								result = await abortable(
-									manager.getHover(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								result = await withTimeout(
+									(token) => manager.getHover(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"hover",
 									signal,
 								);
 								break;
 							case "documentHighlight":
-								result = await abortable(
-									manager.getDocumentHighlights(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								result = await withTimeout(
+									(token) => manager.getDocumentHighlights(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"documentHighlight",
 									signal,
 								);
 								break;
 							case "documentSymbol":
-								result = await abortable(
-									manager.getDocumentSymbols(params.filePath!),
+								result = await withTimeout(
+									(token) => manager.getDocumentSymbols(params.filePath!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"documentSymbol",
 									signal,
 								);
 								break;
@@ -1025,109 +1028,90 @@ export default function (pi: ExtensionAPI) {
 								);
 								break;
 							case "goToImplementation":
-								result = await abortable(
-									manager.getImplementation(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								result = await withTimeout(
+									(token) => manager.getImplementation(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"goToImplementation",
 									signal,
 								);
 								break;
 							case "typeDefinition":
-								result = await abortable(
-									manager.getTypeDefinition(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								result = await withTimeout(
+									(token) => manager.getTypeDefinition(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"typeDefinition",
 									signal,
 								);
 								break;
 							case "prepareCallHierarchy":
-								result = await abortable(
-									manager.prepareCallHierarchy(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								result = await withTimeout(
+									(token) => manager.prepareCallHierarchy(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"prepareCallHierarchy",
 									signal,
 								);
 								break;
 							case "incomingCalls": {
-								const items = await abortable(
-									manager.prepareCallHierarchy(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								const items = await withTimeout(
+									(token) => manager.prepareCallHierarchy(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"prepareCallHierarchy",
 									signal,
 								);
 								result = items.length
-									? await abortable(manager.getIncomingCalls(items[0]!), signal)
+									? await withTimeout((token) => manager.getIncomingCalls(items[0]!, token), INTERACTIVE_LSP_REQUEST_TIMEOUT_MS, "incomingCalls", signal)
 									: [];
 								break;
 							}
 							case "outgoingCalls": {
-								const items = await abortable(
-									manager.prepareCallHierarchy(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								const items = await withTimeout(
+									(token) => manager.prepareCallHierarchy(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"prepareCallHierarchy",
 									signal,
 								);
 								result = items.length
-									? await abortable(manager.getOutgoingCalls(items[0]!), signal)
+									? await withTimeout((token) => manager.getOutgoingCalls(items[0]!, token), INTERACTIVE_LSP_REQUEST_TIMEOUT_MS, "outgoingCalls", signal)
 									: [];
 								break;
 							}
 							case "signatureHelp":
-								result = await abortable(
-									manager.getSignatureHelp(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								result = await withTimeout(
+									(token) => manager.getSignatureHelp(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"signatureHelp",
 									signal,
 								);
 								break;
 							case "rename":
-								result = await abortable(
-									manager.rename(
-										params.filePath!,
-										params.line!,
-										params.character!,
-										params.newName!,
-									),
+								result = await withTimeout(
+									(token) => manager.rename(params.filePath!, params.line!, params.character!, params.newName!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"rename",
 									signal,
 								);
 								break;
 							case "prepareRename":
-								result = await abortable(
-									manager.prepareRename(
-										params.filePath!,
-										params.line!,
-										params.character!,
-									),
+								result = await withTimeout(
+									(token) => manager.prepareRename(params.filePath!, params.line!, params.character!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"prepareRename",
 									signal,
 								);
 								break;
 							case "foldingRange":
-								result = await abortable(
-									manager.getFoldingRanges(params.filePath!),
+								result = await withTimeout(
+									(token) => manager.getFoldingRanges(params.filePath!, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"foldingRange",
 									signal,
 								);
 								break;
 							case "codeAction":
-								result = await abortable(
-									manager.getCodeActions(
-										params.filePath!,
-										params.line!,
-										params.character!,
-										params.endLine,
-										params.endCharacter,
-									),
+								result = await withTimeout(
+									(token) => manager.getCodeActions(params.filePath!, params.line!, params.character!, params.endLine, params.endCharacter, token),
+									INTERACTIVE_LSP_REQUEST_TIMEOUT_MS,
+									"codeAction",
 									signal,
 								);
 								break;

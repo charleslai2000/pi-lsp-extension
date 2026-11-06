@@ -30,6 +30,7 @@ import {
 	selectDevDocsDocsets,
 } from "../devdocs-core.js";
 import { TreeSitterManager } from "../tree-sitter-wasm-core.js";
+import { CancellationTokenSource } from "vscode-jsonrpc";
 
 // ============================================================================
 // Test utilities
@@ -3759,6 +3760,45 @@ path = /tmp
 			);
 		},
 	);
+});
+
+test("LSPManager: forwards cancellation for navigation requests", async () => {
+	await withTempDir({ "Cargo.toml": "[package]\\nname = \\\"definition-timeout\\\"\\nversion = \\\"0.1.0\\\"\\nedition = \\\"2024\\\"\\n", "src/lib.rs": "pub fn probe() {}\\n" }, async (dir) => {
+		const methods: string[] = [];
+		const manager = new LSPManager(dir);
+		const file = join(dir, "src/lib.rs");
+		const client = {
+			serverId: "rust-analyzer",
+			root: dir,
+			closed: false,
+			capabilities: { definitionProvider: true },
+			supportsOperation: () => true,
+			diagnostics: new Map(),
+			openFiles: new Map([[file, { content: "pub fn probe() {}\\n", lastAccess: Date.now(), version: 1 }]]),
+			connection: { sendRequest: (_type: unknown, _params: unknown, token?: { onCancellationRequested: (cb: () => void) => { dispose: () => void } }) => {
+				methods.push("textDocument/definition");
+				return new Promise<never>((_resolve, reject) => {
+					token?.onCancellationRequested(() => { methods.push("$/cancelRequest"); reject(new Error("Request cancelled")); });
+				});
+			} },
+		} as any;
+		(manager as any).clients.set(`rust-analyzer:${dir}`, client);
+		const cancellation = new CancellationTokenSource();
+		const startedAt = Date.now();
+		const request = manager.getDefinition(file, 1, 10, cancellation.token);
+		await new Promise(resolve => setTimeout(resolve, 10));
+		cancellation.cancel();
+		const definitions = await Promise.race([
+			request,
+			new Promise<never>((_, reject) => setTimeout(() => reject(new Error("definition request remained blocked")), 100)),
+		]);
+		assertEquals(definitions.length, 0, "Cancelled definition should not return locations");
+		assert(Date.now() - startedAt < 1000, "Cancellation should release the definition request promptly");
+		assertIncludes(methods, "textDocument/definition", "Expected definition request");
+		assertIncludes(methods, "$/cancelRequest", "Expected cancellation to reach the request token");
+		cancellation.dispose();
+		await manager.shutdown();
+	});
 });
 
 test("LSPManager: bounds stalled document and workspace diagnostic requests", async () => {

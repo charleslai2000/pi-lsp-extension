@@ -59,6 +59,21 @@ test("withTimeout: preserves a completed LSP result", async () => {
   assertEqual(await withTimeout(() => Promise.resolve("ok"), 100, "workspaceSymbol"), "ok");
 });
 
+test("withTimeout: bounds goToDefinition and cancels its request", async () => {
+  let cancelled = false;
+  let timedOut = false;
+  try {
+    await withTimeout((token) => {
+      token.onCancellationRequested(() => { cancelled = true; });
+      return new Promise<never>(() => {});
+    }, 10, "goToDefinition");
+  } catch (error) {
+    timedOut = error instanceof Error && error.message === "goToDefinition timed out after 10ms";
+  }
+  assertEqual(timedOut, true, "Stalled definition must time out");
+  assertEqual(cancelled, true, "Definition timeout must cancel its JSON-RPC request");
+});
+
 test("withTimeout: cancels the underlying LSP request on timeout", async () => {
   let cancelled = false;
   let timedOut = false;
