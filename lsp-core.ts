@@ -735,6 +735,7 @@ export class LSPManager {
   private broken = new Set<string>();
   private cwd: string;
   private cleanupTimer: NodeJS.Timeout | null = null;
+  private shutdownPromise: Promise<void> | null = null;
 
   constructor(cwd: string) {
     this.cwd = cwd;
@@ -877,9 +878,9 @@ export class LSPManager {
 
       client.capabilities = (initResult as any)?.capabilities;
 
-      conn.sendNotification(InitializedNotification.type, {});
+      await conn.sendNotification(InitializedNotification.type, {});
       if (handle.workspaceConfiguration) {
-        conn.sendNotification("workspace/didChangeConfiguration", { settings: handle.workspaceConfiguration });
+        await conn.sendNotification("workspace/didChangeConfiguration", { settings: handle.workspaceConfiguration });
       }
       return client;
     } catch { this.broken.add(k); return undefined; }
@@ -933,7 +934,7 @@ export class LSPManager {
           new Promise(resolve => setTimeout(resolve, 1000)),
         ]);
       } catch {}
-      try { void client.connection.sendNotification("exit").catch(() => {}); } catch {}
+      try { await client.connection.sendNotification("exit"); } catch {}
     }
 
     try { client.connection.end(); } catch {}
@@ -1919,6 +1920,12 @@ export class LSPManager {
   }
 
   async shutdown() {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shutdownPromise = this.shutdownClients();
+    return this.shutdownPromise;
+  }
+
+  private async shutdownClients(): Promise<void> {
     if (this.cleanupTimer) { clearInterval(this.cleanupTimer); this.cleanupTimer = null; }
     const clients = Array.from(this.clients.values());
     this.clients.clear();
@@ -1932,7 +1939,7 @@ export class LSPManager {
             new Promise(r => setTimeout(r, 1000))
           ]);
         } catch {}
-        try { void c.connection.sendNotification("exit").catch(() => {}); } catch {}
+        try { await c.connection.sendNotification("exit"); } catch {}
       }
       try { c.connection.end(); } catch {}
       try { c.process.kill(); } catch {}
