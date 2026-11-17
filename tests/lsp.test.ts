@@ -31,6 +31,8 @@ import {
 } from "../devdocs-core.js";
 import { TreeSitterManager } from "../tree-sitter-wasm-core.js";
 import { CancellationTokenSource } from "vscode-jsonrpc";
+import { setResolvedLspSettingsOverride } from "../lsp-settings.js";
+import { spawn } from "node:child_process";
 
 // ============================================================================
 // Test utilities
@@ -3826,6 +3828,68 @@ test("LSPManager: bounds stalled document and workspace diagnostic requests", as
 		await manager.shutdown();
 	}
 });
+
+test("LSPManager: contains queued write failures after the LSP server exits", async () => {
+  await withTempDir(
+    { "package.json": "{}\n", "src/main.ts": "export const value = 1;\n" },
+    async (dir) => {
+      const file = join(dir, "src/main.ts");
+      const server = join(dir, "server.cjs");
+      const childScript = String.raw`
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", line => {
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.method === "initialize") {
+    const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { capabilities: { textDocumentSync: 2, definitionProvider: true } } }));
+    process.stdout.write("Content-Length: " + body.length + "\\r\\n\\r\\n");
+    process.stdout.write(body);
+    return;
+  }
+  if (message.method === "textDocument/definition") process.exit(0);
+});`;
+      await writeFile(server, childScript);
+      const settings = loadResolvedLspSettings(dir);
+      const originalSettings = {
+        ...settings,
+        servers: { ...settings.servers },
+      };
+      settings.servers.typescript = {
+        command: process.execPath,
+        args: [server],
+        rootMarkers: ["package.json"],
+      };
+      settings.analyzerEnabled = false;
+      setResolvedLspSettingsOverride(dir, settings);
+      const manager = new LSPManager(dir);
+      let uncaught: unknown;
+      const onUncaught = (error: unknown) => {
+        uncaught = error;
+      };
+      process.on("uncaughtException", onUncaught);
+      try {
+        const result = await manager.getDefinition(file, 1, 1);
+        assertEquals(
+          result.length,
+          0,
+          "The abruptly exited server should not return definitions",
+        );
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        assertEquals(
+          uncaught,
+          undefined,
+          "A destroyed LSP stream must not escape as uncaughtException",
+        );
+      } finally {
+        process.off("uncaughtException", onUncaught);
+        await manager.shutdown();
+        setResolvedLspSettingsOverride(dir, originalSettings);
+      }
+    },
+  );
+});
+
 
 test("LSPManager: falls back to Tree-sitter diagnostics without LSP root", async () => {
 	await withTempDir(

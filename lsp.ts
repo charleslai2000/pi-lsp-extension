@@ -438,6 +438,7 @@ export default function (pi: ExtensionAPI) {
   let analyzerHookMode: AnalyzerHookMode = DEFAULT_ANALYZER_HOOK_MODE;
   let activity: LspActivity = "idle";
   let diagnosticsAbort: AbortController | null = null;
+  let diagnosticsRunCount = 0;
   let shuttingDown = false;
   let idleShutdownTimer: NodeJS.Timeout | null = null;
   const mutationToolResultsSeen = new Set<string>();
@@ -540,6 +541,10 @@ export default function (pi: ExtensionAPI) {
     idleShutdownTimer = setTimeout(() => {
       idleShutdownTimer = null;
       if (shuttingDown) return;
+      if (diagnosticsRunCount > 0) {
+        scheduleIdleShutdown();
+        return;
+      }
       void shutdownLspServersForIdle();
     }, LSP_IDLE_SHUTDOWN_MS);
 
@@ -1316,11 +1321,11 @@ export default function (pi: ExtensionAPI) {
       const abort = new AbortController();
       diagnosticsAbort?.abort();
       diagnosticsAbort = abort;
-
-      // Avoid showing a transient "working" state during agent-end diagnostics.
       const files = Array.from(touchedFiles.entries());
       touchedFiles.clear();
+      diagnosticsRunCount++;
 
+      // Avoid showing a transient "working" state during agent-end diagnostics.
       try {
         const outputs: string[] = [];
         for (const [filePath, includeWarnings] of files) {
@@ -1355,6 +1360,7 @@ export default function (pi: ExtensionAPI) {
         }
       } finally {
         if (diagnosticsAbort === abort) diagnosticsAbort = null;
+        diagnosticsRunCount--;
         if (!shuttingDown) setActivity("idle");
       }
     } finally {

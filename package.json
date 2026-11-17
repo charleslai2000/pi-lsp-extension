@@ -8,6 +8,8 @@
     "test:detect": "npx tsx tests/language-detect.test.ts",
     "test:integration": "npx tsx tests/lsp-integration.test.ts",
     "test:workspace-symbol-timeout": "npx tsx tests/workspace-symbol-timeout-e2e.ts",
+    "test:jsonrpc-send-failure": "npx tsx tests/jsonrpc-send-failure.test.ts",
+    "postinstall": "node scripts/patch-vscode-jsonrpc.cjs",
     "test:all": "npm test && npm run test:tool && npm run test:detect && npm run test:integration"
   },
   "keywords": [

@@ -755,7 +755,7 @@ export class LSPManager {
   private closeFile(client: LSPClient, absPath: string) {
     if (!client.openFiles.has(absPath)) return;
     client.openFiles.delete(absPath);
-    if (client.closed) return;
+    if (client.closed || client.process?.stdin?.destroyed) return;
     try {
       void client.connection.sendNotification(DidCloseTextDocumentNotification.type, {
         textDocument: { uri: pathToFileURL(absPath).href },
@@ -831,7 +831,7 @@ export class LSPManager {
         listeners2?.slice().forEach(fn => { try { fn(); } catch { /* listener error */ } });
       });
 
-      // Handle errors to prevent crashes
+      // Consume transport errors here; notification writes below observe their rejected promises.
       conn.onError(() => {});
       conn.onClose(() => { client.closed = true; this.clients.delete(k); });
 
@@ -856,7 +856,7 @@ export class LSPManager {
 
       conn.listen();
 
-      const initResult = await timeout(conn.sendRequest(InitializeRequest.method, {
+      const initializeRequest = this.sendSafeRequest(conn, InitializeRequest.method, {
         rootUri: pathToFileURL(root).href,
         rootPath: root,
         processId: process.pid,
@@ -874,7 +874,11 @@ export class LSPManager {
             diagnostic: { dynamicRegistration: false, relatedDocumentSupport: false },
           },
         },
-      }), INIT_TIMEOUT_MS, `${config.id} init`);
+      });
+      // The timeout can win while initialize is still in flight. Consume a later
+      // transport rejection so it cannot become an unhandled process exception.
+      void initializeRequest.catch(() => {});
+      const initResult = await timeout(initializeRequest, INIT_TIMEOUT_MS, `${config.id} init`);
 
       client.capabilities = (initResult as any)?.capabilities;
 
@@ -930,7 +934,7 @@ export class LSPManager {
     if (!wasClosed) {
       try {
         await Promise.race([
-          client.connection.sendRequest("shutdown"),
+          this.sendSafeRequest(client.connection, "shutdown", undefined),
           new Promise(resolve => setTimeout(resolve, 1000)),
         ]);
       } catch {}
@@ -1044,6 +1048,14 @@ export class LSPManager {
     return matches.length;
   }
 
+  private sendSafeRequest<T>(connection: MessageConnection, method: string, params: unknown, token?: CancellationToken): Promise<T> {
+    // vscode-jsonrpc 8.x uses an async Promise executor and rethrows writer failures.
+    // That throw escapes even when callers attach .catch(), causing Pi's uncaughtException.
+    return Promise.resolve().then(() => token
+      ? connection.sendRequest(method, params, token)
+      : connection.sendRequest(method, params)) as Promise<T>;
+  }
+
   private getSupportedClients(clients: LSPClient[], operation: string): LSPClient[] {
     return clients.filter(client => !client.closed && this.supportsOperationForClient(client, operation));
   }
@@ -1056,14 +1068,15 @@ export class LSPManager {
     mapResult?: (value: T) => R,
   ): Promise<R> {
     if (!token) {
-      const result = await client.connection.sendRequest(method, params);
+      const request = this.sendSafeRequest<T>(client.connection, method, params);
+      const result = await request;
       return mapResult ? mapResult(result as T) : result as R;
     }
     if (token.isCancellationRequested) throw new Error("Request cancelled");
     const requestCancellation = new CancellationTokenSource();
     const subscription = token.onCancellationRequested(() => requestCancellation.cancel());
     try {
-      const request = client.connection.sendRequest(method, params, requestCancellation.token) as Promise<T>;
+      const request = this.sendSafeRequest<T>(client.connection, method, params, requestCancellation.token);
       let cancellationSubscription: { dispose: () => void } | undefined;
       const cancelled = new Promise<never>((_, reject) => {
         if (token.isCancellationRequested) reject(new Error("Request cancelled"));
@@ -1229,7 +1242,7 @@ export class LSPManager {
   private async openOrUpdate(clients: LSPClient[], absPath: string, uri: string, langId: string, content: string, evict = true) {
     const now = Date.now();
     for (const client of clients) {
-      if (client.closed) continue;
+      if (client.closed || client.process?.stdin?.destroyed || client.process?.exitCode != null) continue;
       const state = client.openFiles.get(absPath);
       try {
         if (state) {
@@ -1392,6 +1405,9 @@ export class LSPManager {
 
     // Only attempt Pull Diagnostics if the server advertises support.
     // (Some servers throw and log noisy errors if we call these methods.)
+    if (client.process?.stdin?.destroyed || client.process?.exitCode != null) {
+      return { diagnostics: [], responded: false };
+    }
     if (!client.capabilities || !(client.capabilities as any).diagnosticProvider) {
       return { diagnostics: [], responded: false };
     }
@@ -1401,7 +1417,7 @@ export class LSPManager {
     // Prefer new Pull Diagnostics if supported by the server
     try {
       const res: any = await timeout(
-        abortable(client.connection.sendRequest(DocumentDiagnosticRequest.method, {
+        abortable(this.sendSafeRequest(client.connection, DocumentDiagnosticRequest.method, {
           textDocument: { uri },
         }), signal),
         diagnosticTimeoutMs(signal, startedAt, DIAGNOSTIC_REQUEST_TIMEOUT_MS),
@@ -1419,7 +1435,7 @@ export class LSPManager {
       }
       return { diagnostics: [], responded: true };
     } catch (error) {
-      try { client.connection.sendNotification("$/cancelRequest", {}); } catch {}
+      try { void Promise.resolve().then(() => client.connection.sendNotification("$/cancelRequest", {})).catch(() => {}); } catch {}
       if (signal?.aborted || (error instanceof Error && error.message === "Aborted")) {
         return { diagnostics: [], responded: false, aborted: true };
       }
@@ -1428,7 +1444,7 @@ export class LSPManager {
     // Fallback: some servers only support WorkspaceDiagnosticRequest
     try {
       const res: any = await timeout(
-        abortable(client.connection.sendRequest(WorkspaceDiagnosticRequest.method, {
+        abortable(this.sendSafeRequest(client.connection, WorkspaceDiagnosticRequest.method, {
           previousResultIds: [],
         }), signal),
         diagnosticTimeoutMs(signal, startedAt, DIAGNOSTIC_REQUEST_TIMEOUT_MS),
@@ -1445,7 +1461,7 @@ export class LSPManager {
       }
       return { diagnostics: [], responded: true };
     } catch (error) {
-      try { client.connection.sendNotification("$/cancelRequest", {}); } catch {}
+      try { void Promise.resolve().then(() => client.connection.sendNotification("$/cancelRequest", {})).catch(() => {}); } catch {}
       if (signal?.aborted || (error instanceof Error && error.message === "Aborted")) {
         return { diagnostics: [], responded: false, aborted: true };
       }
@@ -1935,7 +1951,7 @@ export class LSPManager {
       if (!wasClosed) {
         try {
           await Promise.race([
-            c.connection.sendRequest("shutdown"),
+            this.sendSafeRequest(c.connection, "shutdown", undefined),
             new Promise(r => setTimeout(r, 1000))
           ]);
         } catch {}
